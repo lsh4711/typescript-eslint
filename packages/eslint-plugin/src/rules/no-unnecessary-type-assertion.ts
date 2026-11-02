@@ -24,6 +24,7 @@ import {
   nullThrows,
   NullThrowsReasons,
 } from '../util';
+import { getParentFunctionNode } from '../util/getParentFunctionNode';
 
 export type Options = [
   {
@@ -684,66 +685,75 @@ export default createRule<Options, MessageIds>({
     function isInGenericContext(
       node: TSESTree.TSAsExpression | TSESTree.TSTypeAssertion,
     ): boolean {
-      // Set to true on a `return`, to tell whether the value leaves a function with a block body
-      let seenReturn = false;
-      // The child of `current`, to tell a call argument from the callee
-      let previous: TSESTree.Node = node;
+      let child: TSESTree.Node = node;
       for (
-        let current: TSESTree.Node | undefined = node.parent;
-        current;
-        previous = current, current = current.parent
+        let current: TSESTree.Node = node.parent;
+        ;
+        child = current, current = current.parent
       ) {
-        // `return x as T` leaves the function like an expression body does
-        if (current.type === AST_NODE_TYPES.ReturnStatement) {
-          seenReturn = true;
+        if (current.type === AST_NODE_TYPES.ConditionalExpression) {
+          if (child === current.test) {
+            return false;
+          }
           continue;
         }
-        // A declaration, like `function f() { return x as T; }`, is never passed to a call
-        if (current.type === AST_NODE_TYPES.FunctionDeclaration) {
-          return false;
+        if (current.type === AST_NODE_TYPES.SequenceExpression) {
+          if (child !== current.expressions.at(-1)) {
+            return false;
+          }
+          continue;
+        }
+        if (current.type === AST_NODE_TYPES.Property) {
+          if (child !== current.value) {
+            return false;
+          }
+          continue;
+        }
+        if (current.type === AST_NODE_TYPES.ArrowFunctionExpression) {
+          if (child !== current.body) {
+            return false;
+          }
+          continue;
         }
         if (
-          current.type === AST_NODE_TYPES.FunctionExpression ||
-          current.type === AST_NODE_TYPES.ArrowFunctionExpression
+          current.type === AST_NODE_TYPES.LogicalExpression ||
+          current.type === AST_NODE_TYPES.ArrayExpression ||
+          current.type === AST_NODE_TYPES.ObjectExpression ||
+          current.type === AST_NODE_TYPES.SpreadElement ||
+          current.type === AST_NODE_TYPES.AwaitExpression ||
+          current.type === AST_NODE_TYPES.TSNonNullExpression ||
+          current.type === AST_NODE_TYPES.TSSatisfiesExpression
         ) {
-          // A block body without a `return`, like `function () { fn(x as T); }`, keeps the value inside
+          continue;
+        }
+        if (current.type === AST_NODE_TYPES.ReturnStatement) {
+          const functionNode = getParentFunctionNode(current);
           if (
-            current.body.type === AST_NODE_TYPES.BlockStatement &&
-            !seenReturn
+            functionNode == null ||
+            functionNode.type === AST_NODE_TYPES.FunctionDeclaration
           ) {
             return false;
           }
-          // The value leaves `function () { return x as T; }` or `() => x as T`
-          seenReturn = false;
+          current = functionNode;
           continue;
         }
         if (
           current.type === AST_NODE_TYPES.CallExpression ||
           current.type === AST_NODE_TYPES.NewExpression
         ) {
-          // A generic call without explicit type arguments, like `fn(x as T)`, infers from the value
-          if (current.typeArguments == null) {
-            if (
-              current.type === AST_NODE_TYPES.CallExpression &&
-              current.callee.type === AST_NODE_TYPES.MemberExpression &&
-              current.arguments.includes(node)
-            ) {
-              continue;
-            }
-            const calleeType = checker.getTypeAtLocation(
-              services.esTreeNodeToTSNodeMap.get(current.callee),
-            );
-            if (hasGenericCallSignature(calleeType)) {
-              return true;
-            }
-          }
-          // Any other call takes the argument as is, so the value goes no further
-          if (current.arguments.some(argument => argument === previous)) {
+          if (
+            current.typeArguments != null ||
+            !current.arguments.some(argument => argument === child)
+          ) {
             return false;
           }
+          const calleeType = checker.getTypeAtLocation(
+            services.esTreeNodeToTSNodeMap.get(current.callee),
+          );
+          return hasGenericCallSignature(calleeType);
         }
+        return false;
       }
-      return false;
     }
 
     function hasPhantomTypeArgumentMismatch(
